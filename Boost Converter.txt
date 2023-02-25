@@ -1,0 +1,316 @@
+#include "driverlib.h"
+#include "device.h"
+#include "board.h"
+
+#define pwm_START_VALUE 10;                                 //PWM的起始值=10
+#define pwm_COUNT_VALUE 10;                                 //PWM每次增加10
+#define pwm_MAX_VALUE 280;                                 //PWM最大值=280
+
+
+#define EPWM1_TIMER_TBPRD  1000U                                 //除頻 100M->數到1所要花的時間  輸入1000->頻率為100k->數到1000所要花的時間
+
+
+#define EPWM1_MAX_CMPA      280U                                 //CMPA的最大值
+#define EPWM1_MIN_CMPA       10U                                 //CMPA的最小值
+
+#define EPWM_CMP_UP           1U
+#define EPWM_CMP_DOWN         0U
+
+//
+// Globals全局變量SS
+//
+typedef struct
+{
+    uint32_t epwmModule;
+    uint16_t epwmCompADirection;
+    uint16_t epwmCompBDirection;
+    uint16_t epwmTimerIntCount;
+    uint16_t epwmMaxCompA;
+    uint16_t epwmMinCompA;
+    uint16_t epwmMaxCompB;
+    uint16_t epwmMinCompB;
+}epwmInformation;
+
+epwmInformation epwm1Info;                                 //(被呼叫的副程式-update compare的值)
+
+uint16_t index;
+uint16_t pwm_current_value;
+volatile uint16_t bufferFull;
+
+bool dacReady = false;//bool type關鍵字是布林代數值(可以是true 或false)  預設為false
+int dacReadyCount = 0;//觸發次數預設為0
+int wInput_HighCnt;//開關高電位
+int wInput_LowCnt;//開關低電位
+int switch01=0;//開關初始值為0
+
+void initEPWM1(void);
+void initGPIO40(void);//GPIO40接開關(開關另一端接地)
+__interrupt void epwm1ISR(void);//epwm中斷
+void updateCompare(epwmInformation *epwmInfo);
+
+void main(void)
+{
+
+    Device_init();
+
+    Device_initGPIO();  //初始化腳位
+
+    Interrupt_initModule();
+
+    Interrupt_initVectorTable();
+
+    Interrupt_register(INT_EPWM1, &epwm1ISR);  //呼叫中斷  將旗標設為1
+
+    Board_init();
+
+    SysCtl_disablePeripheral(SYSCTL_PERIPH_CLK_TBCLKSYNC);;//禁用外部設備(計數器不計數)
+
+    initEPWM1();//初始化EPWM1這個中斷
+    initGPIO40();//初始化GPIO40腳位
+
+    SysCtl_enablePeripheral(SYSCTL_PERIPH_CLK_TBCLKSYNC);//計數器開始計數
+
+    Interrupt_enable(INT_EPWM1);
+
+    EINT;
+    ERTM;
+
+    for(;;)
+    {
+        NOP;
+    }
+}
+
+__interrupt void epwm1ISR(void)  //pwm中斷(被呼叫的時候執行)
+{
+    if ((GPIO_readPin(40) == 1) && dacReady)  //當GPIO_readPin(40)為高電位,且dacReady為false
+         {
+
+             if (dacReadyCount <= 0)  //當觸發次數<= 0
+             {
+                 dacReady = false;  //開關判斷為false
+
+
+             }
+             else
+             {
+                 dacReadyCount--;  //否則dacReadyCount-1(後置遞減運算子)
+             }
+
+         }
+     else if ((GPIO_readPin(40) == 0) && !dacReady)  //否則如果GPIO_readPin(40)接地,且dacReady不為false
+         {
+             if (dacReadyCount >= 20)  //當dac觸發次數>= 20
+             {
+                 dacReady = true; //開關判斷為true
+                 switch01=1;  //並且將switch01這個變數設為1
+             }
+             else
+             {
+                 dacReadyCount++;  //否則否則dacReadyCount+1(後置遞加運算子)
+                 switch01=0;  //並且將switch01這個變數維持在0
+             }
+         }
+             if(switch01==1)  //當switch01這個變數為1時
+             {
+                 //ePWM1A & ePWM1B轉態時機
+                 EPWM_setActionQualifierAction(EPWM1_BASE,                                  //設定第一組pwm(EPWM1)
+                                                   EPWM_AQ_OUTPUT_A,                        //設定EPWM1A為OUTPUT
+                                                   EPWM_AQ_OUTPUT_HIGH,                     //設定為HIGH
+                                                   EPWM_AQ_OUTPUT_ON_TIMEBASE_ZERO);        //設定HIGH的條件(從0開始EPWM1A輸出為HIGH)
+
+                     EPWM_setActionQualifierAction(EPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                                   EPWM_AQ_OUTPUT_A,                        //設定EPWM1A為OUTPUT
+                                                   EPWM_AQ_OUTPUT_LOW,                      //設定為LOW
+                                                   EPWM_AQ_OUTPUT_ON_TIMEBASE_UP_CMPA);     //設定LOW的條件(上數直到CMPA後EPWM1A輸出為LOW)
+
+                     EPWM_setActionQualifierAction(EPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                                   EPWM_AQ_OUTPUT_B,                        //設定EPWM1B為OUTPUT
+                                                   EPWM_AQ_OUTPUT_LOW,                      //設定為LOW
+                                                   EPWM_AQ_OUTPUT_ON_TIMEBASE_ZERO);        //設定LOW的條件(從0開始EPWM1B輸出為LOW)
+
+                     EPWM_setActionQualifierAction(EPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                                   EPWM_AQ_OUTPUT_B,                        //設定EPWM1B為OUTPUT
+                                                   EPWM_AQ_OUTPUT_HIGH,                     //設定為HIGH
+                                                   EPWM_AQ_OUTPUT_ON_TIMEBASE_UP_CMPA);     //設定HIGH的條件(上數直到CMPA後EPWM1B輸出為HIGH)
+
+                 if (pwm_current_value >= 280)  //當現在更新的pwm CompareValue的值>=280
+                     {
+                         pwm_current_value = 280;  //則pwm CompareValue的值維持在280
+                         if ((GPIO_readPin(40) == 1) && dacReady)  //當GPIO_readPin(40)為高電位,且dacReady為false
+                         {
+                             if (dacReadyCount <= 0)  //dacReadyCount->開關觸發次數
+                             {
+                                 dacReady = false;  //開關判斷為false
+                                 switch01=0;  //並且將switch01這個變數維持在0
+                             }
+                         }
+                     }
+                 else
+                 {
+                     pwm_current_value += pwm_COUNT_VALUE;  //否則pwm_current_value = pwm_current_value + pwm_COUNT_VALUE
+                 }
+             }
+             else                                                                       //否則
+             {
+                 EPWM_setActionQualifierAction(EPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                               EPWM_AQ_OUTPUT_A,                        //設定EPWM1A為OUTPUT
+                                               EPWM_AQ_OUTPUT_LOW,                      //設定為LOW
+                                               EPWM_AQ_OUTPUT_ON_TIMEBASE_ZERO);        //設定LOW的條件(從0開始EPWM1A輸出為LOW)
+
+                 EPWM_setActionQualifierAction(EPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                               EPWM_AQ_OUTPUT_A,                        //設定EPWM1A為OUTPUT
+                                               EPWM_AQ_OUTPUT_LOW,                      //設定為LOW
+                                               EPWM_AQ_OUTPUT_ON_TIMEBASE_UP_CMPA);     //設定LOW的條件(上數直到CMPA後EPWM1A輸出為LOW)
+
+                 EPWM_setActionQualifierAction(EPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                               EPWM_AQ_OUTPUT_B,                        //設定EPWM1B為OUTPUT
+                                               EPWM_AQ_OUTPUT_LOW,                      //設定為LOW
+                                               EPWM_AQ_OUTPUT_ON_TIMEBASE_ZERO);        //設定LOW的條件(從0開始EPWM1B輸出為LOW)
+
+                 EPWM_setActionQualifierAction(EPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                               EPWM_AQ_OUTPUT_B,                        //設定EPWM1B為OUTPUT
+                                               EPWM_AQ_OUTPUT_LOW,                      //設定為LOW
+                                               EPWM_AQ_OUTPUT_ON_TIMEBASE_UP_CMPA);     //設定LOW的條件(上數直到CMPA後EPWM1B輸出為LOW)
+                 pwm_current_value = pwm_START_VALUE ;
+             }
+             EPWM_setCounterCompareValue(EPWM1_BASE,
+                                                EPWM_COUNTER_COMPARE_A,
+                                                pwm_current_value);
+                    //EPWM1_A(0~1000)跟"pwm_current_value"(為變動值->定值)比較
+                    //最後讓Duty是28%(280/1000)
+                    EPWM_setCounterCompareValue(EPWM1_BASE,
+                                                EPWM_COUNTER_COMPARE_B,
+                                                pwm_current_value);
+                    //EPWM1_B(0~1000)跟"pwm_current_value"(為變動值->定值)比較
+                    //最後讓Duty是28%(280/1000)
+    EPWM_clearEventTriggerInterruptFlag(myEPWM1_BASE);//結束中斷
+
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP3);//結束中斷
+}
+
+
+void initEPWM1()
+{
+    //
+    // Set-up TBCLK
+    //
+    EPWM_setTimeBasePeriod(myEPWM1_BASE, EPWM1_TIMER_TBPRD);  //將第一組計數器設定頻率以此作為頻率轉換
+    EPWM_setPhaseShift(myEPWM1_BASE, 0U);  //設定相移
+    EPWM_setTimeBaseCounter(myEPWM1_BASE, 0U);  //設定時基計數器
+
+    //
+    // Set Compare values設定比較值
+    //
+    EPWM_setCounterCompareValue(myEPWM1_BASE,
+                                EPWM_COUNTER_COMPARE_A,
+                                pwm_current_value);
+    //EPWM1_A(0~1000)跟"pwm_current_value"(為變動值->定值)比較
+    //最後讓Duty是28%(280/1000)
+
+    EPWM_setCounterCompareValue(myEPWM1_BASE,
+                                EPWM_COUNTER_COMPARE_B,
+                                pwm_current_value);
+    //EPWM1_B(0~1000)跟"pwm_current_value"(為變動值->定值)比較
+    //最後讓Duty是28%(280/1000)
+
+    // Set up counter mode設定計數器模式
+    EPWM_setTimeBaseCounterMode(myEPWM1_BASE, EPWM_COUNTER_MODE_UP);//設定時基計數器模式(起始的方向EPWM_COUNTER_MODE_UP為上數的計數器)
+    EPWM_disablePhaseShiftLoad(myEPWM1_BASE);
+    EPWM_setClockPrescaler(myEPWM1_BASE,
+                           EPWM_CLOCK_DIVIDER_1,   //內建除頻(不需要)
+                           EPWM_HSCLOCK_DIVIDER_1);
+
+    //
+    // Set up shadowing
+    //
+    EPWM_setCounterCompareShadowLoadMode(myEPWM1_BASE,
+                                         EPWM_COUNTER_COMPARE_A,
+                                         EPWM_COMP_LOAD_ON_CNTR_ZERO);
+    //ShadowLoad影子暫存器(將算完的結果暫存)...在計數器為零時加載(更新)COMPARE_A(值)
+    EPWM_setCounterCompareShadowLoadMode(myEPWM1_BASE,
+                                         EPWM_COUNTER_COMPARE_B,
+                                         EPWM_COMP_LOAD_ON_CNTR_ZERO);
+    //ShadowLoad影子暫存器(將算完的結果暫存)...在計數器為零時加載(更新)COMPARE_B(值)
+    //
+    // Set actions
+    //
+    EPWM_setActionQualifierAction(myEPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                  EPWM_AQ_OUTPUT_A,                          //設定EPWM1A為OUTPUT
+                                  EPWM_AQ_OUTPUT_HIGH,                       //設定為HIGH
+                                  EPWM_AQ_OUTPUT_ON_TIMEBASE_ZERO);          //設定HIGH的條件(從0開始EPWM1A輸出為HIGH)
+    EPWM_setActionQualifierAction(myEPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                  EPWM_AQ_OUTPUT_A,                          //設定EPWM1A為OUTPUT
+                                  EPWM_AQ_OUTPUT_LOW,                        //設定為LOW
+                                  EPWM_AQ_OUTPUT_ON_TIMEBASE_UP_CMPA);       //設定LOW的條件(上數直到CMPA後EPWM1A輸出為LOW)
+    EPWM_setActionQualifierAction(myEPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                  EPWM_AQ_OUTPUT_B,                          //設定EPWM1B為OUTPUT
+                                  EPWM_AQ_OUTPUT_HIGH,                       //設定為HIGH
+                                  EPWM_AQ_OUTPUT_ON_TIMEBASE_UP_CMPA);       //設定HIGH的條件(上數直到CMPA後EPWM1B輸出為HIGH)
+    EPWM_setActionQualifierAction(myEPWM1_BASE,                              //設定第一組pwm(EPWM1)
+                                  EPWM_AQ_OUTPUT_B,                          //設定EPWM1B為OUTPUT
+                                  EPWM_AQ_OUTPUT_LOW,                        //設定為LOW
+                                  EPWM_AQ_OUTPUT_ON_TIMEBASE_ZERO);          //設定LOW的條件(從0開始EPWM1B輸出為LOW)
+          //
+          // Use EPWMA as the input for both RED and FED
+          //
+          EPWM_setRisingEdgeDeadBandDelayInput(myEPWM1_BASE, EPWM_DB_INPUT_EPWMA);  //設定PWM前後保留的寬度(deadtime)
+          EPWM_setFallingEdgeDeadBandDelayInput(myEPWM1_BASE, EPWM_DB_INPUT_EPWMA);  //設定PWM前後保留的寬度(deadtime)
+
+          //
+          // Set the RED and FED values
+          //
+          EPWM_setFallingEdgeDelayCount(myEPWM1_BASE, 20);
+          EPWM_setRisingEdgeDelayCount(myEPWM1_BASE, 20);
+
+          //
+          // Invert only the Falling Edge delayed output (AHC)
+          //
+          EPWM_setDeadBandDelayPolarity(myEPWM1_BASE, EPWM_DB_RED, EPWM_DB_POLARITY_ACTIVE_HIGH);  //deadtime起始時為高態
+          EPWM_setDeadBandDelayPolarity(myEPWM1_BASE, EPWM_DB_FED, EPWM_DB_POLARITY_ACTIVE_LOW);  //deadtime起始時為低態
+
+          //
+          // Use the delayed signals instead of the original signals
+          //
+          EPWM_setDeadBandDelayMode(myEPWM1_BASE, EPWM_DB_RED, true);
+          EPWM_setDeadBandDelayMode(myEPWM1_BASE, EPWM_DB_FED, true);
+
+          //
+          // DO NOT Switch Output A with Output B
+          //
+          EPWM_setDeadBandOutputSwapMode(myEPWM1_BASE, EPWM_DB_OUTPUT_A, false);
+          EPWM_setDeadBandOutputSwapMode(myEPWM1_BASE, EPWM_DB_OUTPUT_B, false);
+
+    //
+    // Interrupt where we will change the Compare Values
+    // Select INT on Time base counter zero event,
+    // Enable INT, generate INT on 3rd event
+    //
+    EPWM_setInterruptSource(myEPWM1_BASE, EPWM_INT_TBCTR_ZERO);//設定中斷源(在時基為0時)
+    EPWM_enableInterrupt(myEPWM1_BASE);
+    EPWM_setInterruptEventCount(myEPWM1_BASE, 3U);
+
+    //
+    // Information this example uses to keep track of the direction the
+    // CMPA/CMPB values are moving, the min and max allowed values and
+    // a pointer to the correct ePWM registers
+    //
+    epwm1Info.epwmCompADirection = EPWM_CMP_UP;
+    epwm1Info.epwmCompBDirection = EPWM_CMP_DOWN;
+    epwm1Info.epwmTimerIntCount = 0U;
+    epwm1Info.epwmModule = myEPWM1_BASE;
+    epwm1Info.epwmMaxCompA = EPWM1_MAX_CMPA;
+    epwm1Info.epwmMinCompA = EPWM1_MIN_CMPA;
+}
+
+
+
+void initGPIO40(void)
+{
+
+    GPIO_setDirectionMode(40, GPIO_DIR_MODE_IN);  //設定GPIO40為輸入腳
+    GPIO_setPadConfig(40, GPIO_PIN_TYPE_PULLUP);
+    GPIO_setMasterCore(40, GPIO_CORE_CPU1);
+    GPIO_setQualificationMode(40, GPIO_QUAL_SYNC);
+
+}
